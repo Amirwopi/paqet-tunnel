@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.11.4"
+INSTALLER_VERSION="1.11.5"
 PAQET_VERSION="latest"
 OFFLINE_MODE=false
 PAQET_DIR="/opt/paqet"
@@ -410,6 +410,61 @@ get_all_configs() {
     for f in "$PAQET_DIR"/config-*.yaml; do
         [ -f "$f" ] && echo "$f"
     done
+}
+
+get_config_role() {
+    grep "^role:" "$1" 2>/dev/null | awk '{print $2}' | tr -d '"'
+}
+
+get_server_configs() {
+    local all=$(get_all_configs)
+    [ -z "$all" ] && return 0
+    while IFS= read -r f; do
+        [ -n "$f" ] && [ "$(get_config_role "$f")" = "server" ] && echo "$f"
+    done <<< "$all"
+}
+
+detect_host_role() {
+    local all=$(get_all_configs)
+    if [ -z "$all" ]; then
+        echo "none"
+        return 0
+    fi
+    local has_server=0 has_client=0
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$(get_config_role "$f")" in
+            server) has_server=1 ;;
+            client) has_client=1 ;;
+        esac
+    done <<< "$all"
+    if [ "$has_server" -eq 1 ] && [ "$has_client" -eq 1 ]; then
+        echo "mixed"
+    elif [ "$has_server" -eq 1 ]; then
+        echo "server"
+    elif [ "$has_client" -eq 1 ]; then
+        echo "client"
+    else
+        echo "none"
+    fi
+}
+
+print_host_role_banner() {
+    case "$(detect_host_role)" in
+        server)
+            echo -e "${GREEN}[●]${NC} This host: ${CYAN}Server B${NC} (Abroad — paqet server)"
+            ;;
+        client)
+            echo -e "${GREEN}[●]${NC} This host: ${CYAN}Server A${NC} (Entry point — paqet client)"
+            ;;
+        mixed)
+            echo -e "${YELLOW}[!]${NC} This host has both ${CYAN}Server B${NC} and ${CYAN}Server A${NC} configs"
+            ;;
+        none)
+            echo -e "${YELLOW}[i]${NC} Not configured — setup ${CYAN}1${NC} (abroad) or ${CYAN}2${NC} (entry point)"
+            ;;
+    esac
+    echo ""
 }
 
 # Extract tunnel name from config path
@@ -1692,9 +1747,13 @@ check_status() {
     while IFS= read -r config_file; do
         local name=$(get_tunnel_name "$config_file")
         local service=$(get_tunnel_service "$config_file")
-        local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
+        local role=$(get_config_role "$config_file")
         
-        echo -e "${YELLOW}── Tunnel: ${CYAN}${name}${YELLOW} (${role}) ──${NC}"
+        if [ "$role" = "server" ]; then
+            echo -e "${YELLOW}── Server B ──${NC}"
+        else
+            echo -e "${YELLOW}── Tunnel: ${CYAN}${name}${YELLOW} ──${NC}"
+        fi
         
         # Service status
         if systemctl is-active --quiet "$service" 2>/dev/null; then
@@ -1847,8 +1906,14 @@ view_config() {
     select_config "Select configuration to view" || return 1
     
     echo ""
+    local role=$(get_config_role "$PAQET_CONFIG")
     local name=$(get_tunnel_name "$PAQET_CONFIG")
-    echo -e "${YELLOW}Configuration for tunnel '${name}':${NC}"
+    echo ""
+    if [ "$role" = "server" ]; then
+        echo -e "${YELLOW}Configuration for Server B:${NC}"
+    else
+        echo -e "${YELLOW}Configuration for tunnel '${name}':${NC}"
+    fi
     echo ""
     
     if [ -f "$PAQET_CONFIG" ]; then
@@ -1874,11 +1939,15 @@ edit_config() {
     select_config "Select configuration to edit" || return 1
     
     # Detect current role
-    local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    local role=$(get_config_role "$PAQET_CONFIG")
     local name=$(get_tunnel_name "$PAQET_CONFIG")
     
     echo ""
-    echo -e "Tunnel: ${CYAN}$name${NC}  Role: ${CYAN}$role${NC}"
+    if [ "$role" = "server" ]; then
+        echo -e "Instance: ${CYAN}Server B${NC}  Role: ${CYAN}$role${NC}"
+    else
+        echo -e "Tunnel: ${CYAN}$name${NC}  Role: ${CYAN}$role${NC}"
+    fi
     echo ""
     echo -e "${YELLOW}What would you like to edit?${NC}"
     echo ""
@@ -2490,11 +2559,15 @@ test_connection() {
     
     select_config "Select configuration to test" || return 1
     
-    local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    local role=$(get_config_role "$PAQET_CONFIG")
     local name=$(get_tunnel_name "$PAQET_CONFIG")
     
     echo ""
-    echo -e "Tunnel: ${CYAN}$name${NC}  Role: ${CYAN}$role${NC}"
+    if [ "$role" = "server" ]; then
+        echo -e "Instance: ${CYAN}Server B${NC}  Role: ${CYAN}$role${NC}"
+    else
+        echo -e "Tunnel: ${CYAN}$name${NC}  Role: ${CYAN}$role${NC}"
+    fi
     echo ""
     
     # Check if service is running
@@ -2705,29 +2778,138 @@ test_server_a() {
 }
 
 #===============================================================================
+# Manage Server Menu (Server B)
+#===============================================================================
+
+select_server_config() {
+    local configs=$(get_server_configs)
+    local count=0
+    if [ -n "$configs" ]; then
+        count=$(echo "$configs" | wc -l)
+    fi
+
+    if [ -z "$configs" ] || [ "$count" -eq 0 ]; then
+        print_error "No Server B configuration found"
+        print_info "Use option 1 to set up Server B"
+        return 1
+    fi
+
+    if [ "$count" -eq 1 ]; then
+        PAQET_CONFIG=$(echo "$configs" | head -1)
+        PAQET_SERVICE=$(get_tunnel_service "$PAQET_CONFIG")
+        return 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Select Server B instance:${NC}"
+    echo ""
+    _print_config_list "$configs"
+    echo ""
+    read -p "Number: " config_choice < /dev/tty
+
+    if ! [[ "$config_choice" =~ ^[0-9]+$ ]] || [ "$config_choice" -lt 1 ] || [ "$config_choice" -gt "$count" ]; then
+        print_error "Invalid choice"
+        return 1
+    fi
+
+    PAQET_CONFIG=$(echo "$configs" | sed -n "${config_choice}p")
+    PAQET_SERVICE=$(get_tunnel_service "$PAQET_CONFIG")
+    return 0
+}
+
+server_service_action() {
+    local action="$1"
+    echo ""
+
+    select_server_config || return 1
+
+    print_step "${action^}ing paqet server ($PAQET_SERVICE)..."
+
+    if systemctl "$action" "$PAQET_SERVICE" 2>/dev/null; then
+        sleep 1
+        if [ "$action" = "stop" ]; then
+            print_success "Server B stopped"
+        elif systemctl is-active --quiet "$PAQET_SERVICE" 2>/dev/null; then
+            print_success "Server B is running"
+        else
+            print_error "Server B failed to start"
+            echo -e "${YELLOW}Check logs:${NC} journalctl -u $PAQET_SERVICE -n 20"
+        fi
+    else
+        print_error "Failed to $action Server B"
+    fi
+
+    PAQET_CONFIG="$PAQET_DIR/config.yaml"
+    PAQET_SERVICE="paqet"
+}
+
+manage_server_menu() {
+    while true; do
+        print_banner
+        echo -e "${YELLOW}Manage Server (Server B)${NC}"
+        echo ""
+
+        local configs=$(get_server_configs)
+        if [ -n "$configs" ]; then
+            echo -e "${YELLOW}Current Server:${NC}"
+            echo ""
+            _print_config_list "$configs"
+        else
+            print_info "No Server B configuration found"
+            print_info "Use main menu option 1 to set up Server B"
+        fi
+
+        echo ""
+        echo -e "${YELLOW}Options:${NC}"
+        echo ""
+        echo -e "  ${CYAN}r)${NC} Restart paqet server"
+        echo -e "  ${CYAN}s)${NC} Stop paqet server"
+        echo -e "  ${CYAN}t)${NC} Start paqet server"
+        echo -e "  ${CYAN}c)${NC} Reconfigure Server B"
+        echo -e "  ${CYAN}0)${NC} Back to main menu"
+        echo ""
+
+        read -p "Action: " manage_choice < /dev/tty
+
+        case $manage_choice in
+            [Rr]) server_service_action "restart" ;;
+            [Ss]) server_service_action "stop" ;;
+            [Tt]) server_service_action "start" ;;
+            [Cc]) install_dependencies; setup_server_b ;;
+            0) return 0 ;;
+            *) print_error "Invalid choice" ;;
+        esac
+
+        echo ""
+        echo -e "${YELLOW}Press Enter to continue...${NC}"
+        read < /dev/tty
+    done
+}
+
+#===============================================================================
 # Manage Tunnels Menu
 #===============================================================================
 
 manage_tunnels_menu() {
     while true; do
         print_banner
-        echo -e "${YELLOW}Manage Tunnels${NC}"
+        echo -e "${YELLOW}Manage Tunnels (Server A)${NC}"
         echo ""
         
-        # Show all tunnels
         local configs=$(get_tunnel_configs)
         if [ -n "$configs" ]; then
             echo -e "${YELLOW}Current Tunnels:${NC}"
             echo ""
-            list_tunnels
+            list_tunnels || true
         else
-            print_info "No tunnels configured yet"
+            print_info "No client tunnels configured yet"
+            print_info "Press 'a' to add a tunnel (Server A setup)"
         fi
         
         echo ""
         echo -e "${YELLOW}Options:${NC}"
         echo ""
-        echo -e "  ${CYAN}a)${NC} Add new tunnel (setup Server A)"
+        echo -e "  ${CYAN}a)${NC} Add new tunnel (Server A setup)"
         echo -e "  ${CYAN}x)${NC} Remove tunnel(s)"
         echo -e "  ${CYAN}r)${NC} Restart a tunnel"
         echo -e "  ${CYAN}s)${NC} Stop a tunnel"
@@ -3513,6 +3695,59 @@ is_command_installed() {
     [ -f "$INSTALLER_CMD" ]
 }
 
+run_setup_server_b() {
+    local host_role=$(detect_host_role)
+    if [ "$host_role" = "client" ]; then
+        echo ""
+        print_warning "This host is configured as Server A (entry point)."
+        read_confirm "Set up Server B (abroad server) here anyway?" confirm "n"
+        [ "$confirm" != true ] && return 0
+    fi
+    install_dependencies
+    setup_server_b
+}
+
+run_setup_server_a() {
+    local host_role=$(detect_host_role)
+    if [ "$host_role" = "server" ]; then
+        echo ""
+        print_warning "This host is configured as Server B (abroad server)."
+        read_confirm "Set up Server A (entry point) here anyway?" confirm "n"
+        [ "$confirm" != true ] && return 0
+    fi
+    run_iran_optimizations
+    install_dependencies
+    setup_server_a
+}
+
+run_manage_menu() {
+    case "$(detect_host_role)" in
+        server) manage_server_menu ;;
+        client) manage_tunnels_menu ;;
+        mixed)
+            print_banner
+            echo -e "${YELLOW}Manage${NC}"
+            echo ""
+            echo -e "  ${CYAN}1)${NC} Manage Server B"
+            echo -e "  ${CYAN}2)${NC} Manage Tunnels (Server A)"
+            echo -e "  ${CYAN}0)${NC} Back"
+            echo ""
+            read -p "Choice: " mix_choice < /dev/tty
+            case $mix_choice in
+                1) manage_server_menu ;;
+                2) manage_tunnels_menu ;;
+                0) return 0 ;;
+                *) print_error "Invalid choice" ;;
+            esac
+            ;;
+        none)
+            print_info "Not configured yet."
+            print_info "  Server B (abroad):      option 1"
+            print_info "  Server A (entry point): option 2"
+            ;;
+    esac
+}
+
 #===============================================================================
 # Main Menu
 #===============================================================================
@@ -3548,6 +3783,8 @@ main() {
     while true; do
         print_banner
         
+        print_host_role_banner
+        
         # Show if command is installed
         if is_command_installed; then
             echo -e "${GREEN}[✓] paqet-tunnel command is installed. Run: ${CYAN}paqet-tunnel${NC}"
@@ -3556,17 +3793,40 @@ main() {
         fi
         echo ""
         
+        local host_role=$(detect_host_role)
+        
         echo -e "${YELLOW}Select option:${NC}"
         echo ""
         echo -e "  ${GREEN}── Setup ──${NC}"
-        echo -e "  ${CYAN}1)${NC} Setup Server B (Abroad - VPN server)"
-        echo -e "  ${CYAN}2)${NC} Setup Server A (Iran - entry point)"
+        if [ "$host_role" = "none" ] || [ "$host_role" = "server" ] || [ "$host_role" = "mixed" ]; then
+            if [ "$host_role" = "server" ]; then
+                echo -e "  ${CYAN}1)${NC} Reconfigure Server B (Abroad - VPN server)"
+            else
+                echo -e "  ${CYAN}1)${NC} Setup Server B (Abroad - VPN server)"
+            fi
+        fi
+        if [ "$host_role" = "none" ] || [ "$host_role" = "client" ] || [ "$host_role" = "mixed" ]; then
+            echo -e "  ${CYAN}2)${NC} Setup Server A (Iran - entry point)"
+        fi
         echo ""
         echo -e "  ${GREEN}── Management ──${NC}"
         echo -e "  ${CYAN}3)${NC} Check Status"
         echo -e "  ${CYAN}4)${NC} View Configuration"
         echo -e "  ${CYAN}5)${NC} Edit Configuration"
-        echo -e "  ${CYAN}6)${NC} Manage Tunnels (add/remove/restart)"
+        case "$host_role" in
+            server)
+                echo -e "  ${CYAN}6)${NC} Manage Server (restart/stop/start)"
+                ;;
+            client)
+                echo -e "  ${CYAN}6)${NC} Manage Tunnels (add/remove/restart)"
+                ;;
+            mixed)
+                echo -e "  ${CYAN}6)${NC} Manage (Server B or Tunnels)"
+                ;;
+            none)
+                echo -e "  ${CYAN}6)${NC} Manage (setup required first)"
+                ;;
+        esac
         echo -e "  ${CYAN}7)${NC} Test Connection"
         echo ""
         echo -e "  ${GREEN}── Maintenance ──${NC}"
@@ -3588,12 +3848,24 @@ main() {
         read -p "Choice: " choice < /dev/tty
         
         case $choice in
-            1) install_dependencies; setup_server_b ;;
-            2) run_iran_optimizations; install_dependencies; setup_server_a ;;
+            1)
+                if [ "$host_role" = "client" ]; then
+                    print_error "This host is Server A (entry point). Use option 2 to add tunnels."
+                else
+                    run_setup_server_b
+                fi
+                ;;
+            2)
+                if [ "$host_role" = "server" ]; then
+                    print_error "This host is Server B (abroad). Use option 6 to manage the server."
+                else
+                    run_setup_server_a
+                fi
+                ;;
             3) check_status ;;
             4) view_config ;;
             5) edit_config ;;
-            6) manage_tunnels_menu ;;
+            6) run_manage_menu ;;
             7) test_connection ;;
             8) check_for_updates ;;
             9) show_port_config ;;
