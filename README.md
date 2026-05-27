@@ -2,7 +2,7 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.11.3
+**Current Version:** v1.11.4
 
 ## Start Here
 
@@ -397,6 +397,9 @@ Each tunnel has its own config (`/opt/paqet/config-<name>.yaml`) and service (`p
 4. Response flows back through the tunnel
 
 ### Changelog
+
+#### v1.11.4
+- **Server B Uninstall Fix** - Uninstall no longer aborts on abroad servers; shows the server instance and removes iptables rules for the configured listen port.
 
 #### v1.11.3
 - **Server B Menu Fix** - View Configuration, Edit Configuration (including KCP mode), and Test Connection now recognize Server B (`role: server`) configs instead of reporting "No tunnels configured".

@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.11.3"
+INSTALLER_VERSION="1.11.4"
 PAQET_VERSION="latest"
 OFFLINE_MODE=false
 PAQET_DIR="/opt/paqet"
