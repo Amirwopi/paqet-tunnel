@@ -1091,6 +1091,14 @@ remove_iptables_client() {
     iptables -t mangle -D PREROUTING -p tcp -s $server_ip --sport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
 }
 
+remove_iptables_server() {
+    local port=$1
+    iptables -t raw -D PREROUTING -p tcp --dport $port -j NOTRACK 2>/dev/null || true
+    iptables -t raw -D OUTPUT -p tcp --sport $port -j NOTRACK 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
+}
+
 # Save iptables rules to persistent storage
 save_iptables() {
     if command -v iptables-save &> /dev/null; then
@@ -1739,9 +1747,9 @@ uninstall() {
     local configs=$(get_all_configs)
     
     if [ -n "$configs" ]; then
-        echo -e "${YELLOW}Active tunnels:${NC}"
+        echo -e "${YELLOW}Active instances:${NC}"
         echo ""
-        list_tunnels
+        _print_config_list "$configs"
         echo ""
     fi
     
@@ -1776,19 +1784,15 @@ uninstall() {
     # Remove iptables rules
     print_step "Removing iptables rules..."
     
-    # Remove Server B rules (try common ports)
-    for port in 8888 9999 8080; do
-        iptables -t raw -D PREROUTING -p tcp --dport $port -j NOTRACK 2>/dev/null || true
-        iptables -t raw -D OUTPUT -p tcp --sport $port -j NOTRACK 2>/dev/null || true
-        iptables -t mangle -D OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
-        iptables -t mangle -D PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
-    done
-    
-    # Remove Server A (client) rules by reading existing configs
     if [ -n "$configs" ]; then
         while IFS= read -r config_file; do
             local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
-            if [ "$role" = "client" ]; then
+            if [ "$role" = "server" ]; then
+                local listen_port=$(grep -A1 "^listen:" "$config_file" 2>/dev/null | grep "addr:" | grep -oE '[0-9]+' | tail -1)
+                if [ -n "$listen_port" ]; then
+                    remove_iptables_server "$listen_port"
+                fi
+            elif [ "$role" = "client" ]; then
                 local server_addr=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
                 local s_ip=$(echo "$server_addr" | cut -d':' -f1)
                 local s_port=$(echo "$server_addr" | cut -d':' -f2)
@@ -1798,6 +1802,10 @@ uninstall() {
             fi
         done <<< "$configs"
     fi
+    
+    for port in 8888 9999 8080; do
+        remove_iptables_server "$port"
+    done
     
     save_iptables
     print_success "iptables rules removed"
