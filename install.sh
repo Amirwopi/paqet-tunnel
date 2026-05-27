@@ -2823,6 +2823,22 @@ server_service_action() {
 
     select_server_config || return 1
 
+    if [ ! -f "/etc/systemd/system/${PAQET_SERVICE}.service" ]; then
+        print_error "Service unit not found: ${PAQET_SERVICE}.service"
+        print_info "Use option 'c' to reconfigure Server B and recreate the service"
+        PAQET_CONFIG="$PAQET_DIR/config.yaml"
+        PAQET_SERVICE="paqet"
+        return 1
+    fi
+
+    if [ ! -x "$PAQET_BIN" ]; then
+        print_error "paqet binary not found at $PAQET_BIN"
+        print_info "Use option 'c' to reconfigure Server B and reinstall the binary"
+        PAQET_CONFIG="$PAQET_DIR/config.yaml"
+        PAQET_SERVICE="paqet"
+        return 1
+    fi
+
     print_step "${action^}ing paqet server ($PAQET_SERVICE)..."
 
     if systemctl "$action" "$PAQET_SERVICE" 2>/dev/null; then
@@ -2833,10 +2849,17 @@ server_service_action() {
             print_success "Server B is running"
         else
             print_error "Server B failed to start"
-            echo -e "${YELLOW}Check logs:${NC} journalctl -u $PAQET_SERVICE -n 20"
+            systemctl status "$PAQET_SERVICE" --no-pager -l 2>/dev/null | tail -15 || true
+            echo ""
+            echo -e "${YELLOW}Recent logs:${NC}"
+            journalctl -u "$PAQET_SERVICE" -n 15 --no-pager 2>/dev/null || true
         fi
     else
         print_error "Failed to $action Server B"
+        systemctl status "$PAQET_SERVICE" --no-pager -l 2>/dev/null | tail -15 || true
+        echo ""
+        echo -e "${YELLOW}Recent logs:${NC}"
+        journalctl -u "$PAQET_SERVICE" -n 15 --no-pager 2>/dev/null || true
     fi
 
     PAQET_CONFIG="$PAQET_DIR/config.yaml"
