@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.11.2"
+INSTALLER_VERSION="1.11.3"
 PAQET_VERSION="latest"
 OFFLINE_MODE=false
 PAQET_DIR="/opt/paqet"
@@ -445,15 +445,8 @@ get_tunnel_count() {
     echo "$count"
 }
 
-# List all tunnels with status
-list_tunnels() {
-    local configs=$(get_tunnel_configs)
-    
-    if [ -z "$configs" ]; then
-        print_info "No tunnels configured"
-        return 1
-    fi
-    
+_print_config_list() {
+    local configs="$1"
     local idx=0
     while IFS= read -r config_file; do
         idx=$((idx + 1))
@@ -461,13 +454,11 @@ list_tunnels() {
         local service=$(get_tunnel_service "$config_file")
         local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
         
-        # Get status
         local status="${RED}Stopped${NC}"
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             status="${GREEN}Running${NC}"
         fi
         
-        # Get details based on role
         local details=""
         if [ "$role" = "client" ]; then
             local server_addr=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
@@ -482,8 +473,61 @@ list_tunnels() {
     done <<< "$configs"
 }
 
-# Select a tunnel interactively, sets PAQET_CONFIG and PAQET_SERVICE globals
-# Returns 0 on success, 1 if no tunnels or user cancelled
+list_tunnels() {
+    local configs=$(get_tunnel_configs)
+    
+    if [ -z "$configs" ]; then
+        print_info "No tunnels configured"
+        return 1
+    fi
+    
+    _print_config_list "$configs"
+}
+
+select_config() {
+    local prompt="${1:-Select configuration}"
+    local configs=$(get_all_configs)
+    local count=0
+    if [ -n "$configs" ]; then
+        count=$(echo "$configs" | wc -l)
+    fi
+    
+    if [ -z "$configs" ] || [ "$count" -eq 0 ]; then
+        print_error "No paqet configuration found"
+        print_info "Run setup first"
+        return 1
+    fi
+    
+    if [ "$count" -eq 1 ]; then
+        local config_file=$(echo "$configs" | head -1)
+        PAQET_CONFIG="$config_file"
+        PAQET_SERVICE=$(get_tunnel_service "$config_file")
+        local name=$(get_tunnel_name "$config_file")
+        print_info "Using: $name"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}${prompt}:${NC}"
+    echo ""
+    _print_config_list "$configs"
+    echo ""
+    
+    read -p "Number: " config_choice < /dev/tty
+    
+    if ! [[ "$config_choice" =~ ^[0-9]+$ ]] || [ "$config_choice" -lt 1 ] || [ "$config_choice" -gt "$count" ]; then
+        print_error "Invalid choice"
+        return 1
+    fi
+    
+    local config_file=$(echo "$configs" | sed -n "${config_choice}p")
+    PAQET_CONFIG="$config_file"
+    PAQET_SERVICE=$(get_tunnel_service "$config_file")
+    local name=$(get_tunnel_name "$config_file")
+    print_info "Selected: $name"
+    return 0
+}
+
 select_tunnel() {
     local prompt="${1:-Select tunnel}"
     local configs=$(get_tunnel_configs)
@@ -1792,8 +1836,7 @@ view_config() {
     echo -e "${YELLOW}View Configuration${NC}"
     echo ""
     
-    # Select tunnel if multiple exist
-    select_tunnel "Select tunnel to view" || return 1
+    select_config "Select configuration to view" || return 1
     
     echo ""
     local name=$(get_tunnel_name "$PAQET_CONFIG")
@@ -1820,8 +1863,7 @@ edit_config() {
     echo -e "${YELLOW}Edit Configuration${NC}"
     echo ""
     
-    # Select tunnel if multiple exist
-    select_tunnel "Select tunnel to edit" || return 1
+    select_config "Select configuration to edit" || return 1
     
     # Detect current role
     local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
@@ -2438,8 +2480,7 @@ test_connection() {
     echo -e "${YELLOW}Connection Test Tool${NC}"
     echo ""
     
-    # Select tunnel if multiple exist
-    select_tunnel "Select tunnel to test" || return 1
+    select_config "Select configuration to test" || return 1
     
     local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
     local name=$(get_tunnel_name "$PAQET_CONFIG")
