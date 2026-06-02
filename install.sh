@@ -1404,7 +1404,10 @@ start_and_verify_service() {
 
     print_step "Starting service ${service_name}..."
 
-    if ! systemctl enable --now "$service_name" >/dev/null 2>&1; then
+    # Enable on boot, then restart (not start): an already-running service
+    # would ignore a new config on a plain 'start'. restart always reloads it.
+    systemctl enable "$service_name" >/dev/null 2>&1
+    if ! systemctl restart "$service_name" >/dev/null 2>&1; then
         print_error "Failed to start ${display_name}"
         systemctl status "$service_name" --no-pager -l || true
         return 1
@@ -1508,6 +1511,9 @@ network:
     router_mac: "${gateway_mac}"
   tcp:
     local_flag: ["PA"]
+    remote_flag: ["PA"]
+  pcap:
+    sockbuf: 8388608
 
 transport:
   protocol: "kcp"
@@ -1672,6 +1678,8 @@ network:
   tcp:
     local_flag: ["PA"]
     remote_flag: ["PA"]
+  pcap:
+    sockbuf: 4194304
 
 server:
   addr: "${SERVER_B_IP}:${SERVER_B_PORT}"
