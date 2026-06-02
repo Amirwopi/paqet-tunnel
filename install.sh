@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.11.5"
+INSTALLER_VERSION="2.0.0"
 PAQET_VERSION="latest"
 OFFLINE_MODE=false
 PAQET_DIR="/opt/paqet"
@@ -89,6 +89,10 @@ print_success() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_info() { echo -e "${CYAN}[i]${NC} $1"; }
+print_header() {
+    echo ""
+    echo -e "${MAGENTA}── $1 ──${NC}"
+}
 
 #===============================================================================
 # Input Validation Functions (with retry on invalid input)
@@ -706,6 +710,98 @@ get_gateway_mac() {
         
         echo "$mac"
     fi
+}
+
+# Auto-detect network settings and confirm in a single step (V2).
+# Sets globals: NET_IFACE, NET_LOCAL_IP, NET_PUBLIC_IP, NET_GATEWAY_MAC
+# Only drops into per-field manual entry if detection fails or user declines.
+detect_and_confirm_network() {
+    print_step "Detecting network settings..."
+    NET_IFACE=$(get_default_interface) || true
+    NET_LOCAL_IP=$(get_local_ip "$NET_IFACE") || true
+    NET_PUBLIC_IP=$(get_public_ip) || true
+    NET_GATEWAY_MAC=$(get_gateway_mac) || true
+
+    echo ""
+    echo -e "${YELLOW}Detected network settings:${NC}"
+    echo -e "  Interface:   ${CYAN}${NET_IFACE:-<not found>}${NC}"
+    echo -e "  Local IP:    ${CYAN}${NET_LOCAL_IP:-<not found>}${NC}"
+    echo -e "  Public IP:   ${CYAN}${NET_PUBLIC_IP:-<not found>}${NC}"
+    echo -e "  Gateway MAC: ${CYAN}${NET_GATEWAY_MAC:-<not found>}${NC}"
+    echo ""
+
+    # Inform about NAT (common on VPS) so the public IP in the connection string is expected
+    if [ -n "$NET_LOCAL_IP" ] && [ -n "$NET_PUBLIC_IP" ] && [ "$NET_LOCAL_IP" != "$NET_PUBLIC_IP" ]; then
+        print_info "Behind NAT: local IP differs from public IP (normal for most VPS)."
+    fi
+
+    local all_detected=true
+    [ -z "$NET_IFACE" ] && all_detected=false
+    [ -z "$NET_LOCAL_IP" ] && all_detected=false
+    [ -z "$NET_GATEWAY_MAC" ] && all_detected=false
+
+    local use_detected=true
+    if [ "$all_detected" = true ]; then
+        read_confirm "Use these settings?" use_detected "y"
+    else
+        print_warning "Some settings could not be detected automatically — please enter them."
+        use_detected=false
+    fi
+
+    if [ "$use_detected" != true ]; then
+        read_required "Network interface" NET_IFACE "$NET_IFACE"
+        local redetected_ip=$(get_local_ip "$NET_IFACE")
+        [ -n "$redetected_ip" ] && NET_LOCAL_IP="$redetected_ip"
+        if [ -n "$NET_LOCAL_IP" ]; then
+            read_ip "Local IP" NET_LOCAL_IP "$NET_LOCAL_IP"
+        else
+            read_ip "Local IP" NET_LOCAL_IP
+        fi
+        if [ -n "$NET_GATEWAY_MAC" ]; then
+            read_mac "Gateway MAC address" NET_GATEWAY_MAC "$NET_GATEWAY_MAC"
+        else
+            read_mac "Gateway MAC address (run 'ip neigh' to find it)" NET_GATEWAY_MAC
+        fi
+    fi
+}
+
+# Encode a connection string the Abroad server hands to the Iran server (V2).
+# Args: public_ip paqet_port secret_key forward_ports
+# Output: paqet://<url-safe-base64>
+encode_connection_string() {
+    local payload="ip=$1;port=$2;key=$3;fwd=$4"
+    local b64
+    b64=$(printf '%s' "$payload" | base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+    echo "paqet://${b64}"
+}
+
+# Decode a connection string. Sets globals CS_IP, CS_PORT, CS_KEY, CS_FWD.
+# Returns 1 if the string is malformed or required fields are missing.
+decode_connection_string() {
+    local s="$1"
+    # Trim whitespace first (pasted strings often carry leading/trailing spaces or newlines),
+    # then strip the scheme prefix.
+    s=$(printf '%s' "$s" | tr -d '[:space:]')
+    s="${s#paqet://}"
+    [ -z "$s" ] && return 1
+
+    local b64
+    b64=$(printf '%s' "$s" | tr '_-' '/+')
+    local pad=$(( (4 - ${#b64} % 4) % 4 ))
+    local i
+    for ((i=0; i<pad; i++)); do b64="${b64}="; done
+
+    local payload
+    payload=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+    [ -z "$payload" ] && return 1
+
+    CS_IP=$(printf '%s' "$payload" | grep -oE 'ip=[^;]+' | cut -d= -f2)
+    CS_PORT=$(printf '%s' "$payload" | grep -oE 'port=[^;]+' | cut -d= -f2)
+    CS_KEY=$(printf '%s' "$payload" | grep -oE 'key=[^;]+' | cut -d= -f2)
+    CS_FWD=$(printf '%s' "$payload" | grep -oE 'fwd=[^;]+' | cut -d= -f2)
+
+    [ -n "$CS_IP" ] && [ -n "$CS_PORT" ] && [ -n "$CS_KEY" ] || return 1
+    return 0
 }
 
 check_port_conflict() {
@@ -1424,6 +1520,177 @@ start_and_verify_service() {
 }
 
 #===============================================================================
+# Post-setup Health Check (V2)
+#===============================================================================
+
+# Run an end-to-end health check for a given config + service and print PASS/FAIL.
+# Returns 0 if all critical checks pass, 1 otherwise.
+health_check_config() {
+    local config="$1"
+    local service="$2"
+    local extra_ports="$3"   # optional: V2Ray ports to verify on a server (not stored in config)
+    local role
+    role=$(get_config_role "$config")
+    local fails=0
+
+    print_header "Health Check: ${service}"
+
+    # 1) Service active
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        print_success "Service '${service}' is active"
+    else
+        print_error "Service '${service}' is NOT active"
+        fails=$((fails + 1))
+    fi
+
+    if [ "$role" = "server" ]; then
+        # 2) paqet listening for packets (process up)
+        if pgrep -f "paqet run -c ${config}" >/dev/null 2>&1; then
+            print_success "paqet server process is running"
+        else
+            print_error "paqet server process not found"
+            fails=$((fails + 1))
+        fi
+        # 3) V2Ray/X-UI listening on the forward port(s) on 0.0.0.0
+        # The server config doesn't store the V2Ray ports, so we only check when given them.
+        local v2ray_ports
+        v2ray_ports=$(printf '%s' "$extra_ports" | tr ',' ' ')
+        if [ -n "$v2ray_ports" ]; then
+            local vp ok_v=1
+            for vp in $v2ray_ports; do
+                vp=$(printf '%s' "$vp" | tr -d ' ')
+                [ -z "$vp" ] && continue
+                if ss -tln 2>/dev/null | grep -qE "(\*|0\.0\.0\.0):${vp}\b"; then
+                    print_success "A service is listening on 0.0.0.0:${vp} (V2Ray/X-UI OK)"
+                else
+                    print_warning "Nothing listening on 0.0.0.0:${vp} — make sure V2Ray/X-UI listens there"
+                    ok_v=0
+                fi
+            done
+            [ "$ok_v" -eq 0 ] && print_info "On Server B, V2Ray inbound Listen IP must be 0.0.0.0"
+        else
+            print_info "V2Ray ports unknown here — verify your inbound listens on 0.0.0.0 manually"
+        fi
+    else
+        # CLIENT checks
+        local server_ip server_port fwd_ports
+        server_ip=$(grep -A2 '^server:' "$config" 2>/dev/null | grep 'addr:' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1)
+        server_port=$(grep -A2 '^server:' "$config" 2>/dev/null | grep 'addr:' | grep -oE ':[0-9]+' | tr -d ':' | head -1)
+        fwd_ports=$(grep -oE 'listen:[[:space:]]*"[^"]*"' "$config" 2>/dev/null | grep -oE ':[0-9]+"' | tr -d ':"' | tr '\n' ' ')
+
+        # 2) Listening on local forward port(s)
+        local lp
+        for lp in $fwd_ports; do
+            if ss -tln 2>/dev/null | grep -qE "(\*|0\.0\.0\.0):${lp}\b"; then
+                print_success "paqet is accepting connections on 0.0.0.0:${lp}"
+            else
+                print_error "Not listening on 0.0.0.0:${lp}"
+                fails=$((fails + 1))
+            fi
+        done
+
+        # 3) Return traffic from Server B (give the tunnel a moment to handshake)
+        print_step "Checking tunnel return traffic from ${server_ip}:${server_port} (waiting ~6s)..."
+        sleep 6
+        local ret_pkts
+        ret_pkts=$(iptables -t raw -L PREROUTING -n -v 2>/dev/null | grep "$server_ip" | grep "spt:${server_port}" | awk '{print $1}' | head -1)
+        ret_pkts=${ret_pkts:-0}
+        if [ "$ret_pkts" -gt 0 ] 2>/dev/null; then
+            print_success "Receiving return packets from Server B (${ret_pkts} pkts) — tunnel is alive"
+        else
+            print_error "No return packets from Server B yet — tunnel not established"
+            print_info "Most common causes: Server B paqet not restarted, wrong key, or wrong paqet port"
+            fails=$((fails + 1))
+        fi
+
+        # 4) No 'connection lost' churn in recent logs
+        if journalctl -u "$service" --since "10 seconds ago" --no-pager 2>/dev/null | grep -qi "connection lost"; then
+            print_error "Logs show 'connection lost, retrying' — tunnel is flapping"
+            fails=$((fails + 1))
+        else
+            print_success "No 'connection lost' churn in recent logs"
+        fi
+    fi
+
+    echo ""
+    if [ "$fails" -eq 0 ]; then
+        print_success "HEALTH CHECK PASSED ✓"
+        return 0
+    else
+        print_error "HEALTH CHECK FAILED — ${fails} issue(s) above"
+        return 1
+    fi
+}
+
+# Re-generate and display the Server B connection string for Server A (V2).
+# Derives IP (re-detected), paqet port + key (from config), and V2Ray ports
+# (from the '# inbound_ports:' comment, or prompts if missing on older installs).
+show_connection_string() {
+    print_banner
+    echo -e "${GREEN}Connection String for Server A${NC}"
+    echo ""
+
+    local cfg
+    cfg=$(get_server_configs | head -1)
+    if [ -z "$cfg" ] || [ ! -f "$cfg" ]; then
+        print_error "No Server B (abroad) configuration found on this host."
+        print_info "The connection string is generated on Server B (the abroad server)."
+        return 0
+    fi
+
+    local port key ports pub
+    port=$(grep -A1 '^listen:' "$cfg" 2>/dev/null | grep 'addr:' | grep -oE ':[0-9]+' | tr -d ':' | head -1)
+    key=$(grep 'key:' "$cfg" 2>/dev/null | head -1 | sed -E 's/.*key:[[:space:]]*"?([^"]+)"?.*/\1/')
+    ports=$(grep -iE '^#[[:space:]]*inbound_ports:' "$cfg" 2>/dev/null | sed -E 's/.*inbound_ports:[[:space:]]*//')
+    pub=$(get_public_ip)
+
+    if [ -z "$ports" ]; then
+        print_warning "V2Ray port(s) are not recorded in this config (older install)."
+        read_ports "Enter the V2Ray inbound port(s) used on this server" ports "$DEFAULT_FORWARD_PORTS"
+    fi
+
+    if [ -z "$port" ] || [ -z "$key" ] || [ -z "$pub" ]; then
+        print_error "Could not assemble the connection string (missing port/key/public IP)."
+        echo -e "  Public IP: ${CYAN}${pub:-?}${NC}  Port: ${CYAN}${port:-?}${NC}  Key set: ${CYAN}$([ -n "$key" ] && echo yes || echo no)${NC}"
+        return 0
+    fi
+
+    local conn_string
+    conn_string=$(encode_connection_string "$pub" "$port" "$key" "$ports")
+
+    echo -e "  ${YELLOW}Public IP:${NC}   ${CYAN}$pub${NC}"
+    echo -e "  ${YELLOW}paqet Port:${NC}  ${CYAN}$port${NC}"
+    echo -e "  ${YELLOW}V2Ray Ports:${NC} ${CYAN}$ports${NC}"
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}  Copy this to Server A (Iran):${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${CYAN}${conn_string}${NC}"
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}(Manual fallback):${NC} IP ${CYAN}$pub${NC}  Port ${CYAN}$port${NC}  Key ${CYAN}$key${NC}"
+}
+
+# Run health checks for every paqet config on this host (used from the menu).
+run_health_check_menu() {
+    print_banner
+    local all
+    all=$(get_all_configs)
+    if [ -z "$all" ]; then
+        print_warning "No paqet configuration found on this host yet."
+        return 0
+    fi
+    while IFS= read -r cfg; do
+        [ -z "$cfg" ] && continue
+        local svc
+        svc=$(get_tunnel_service "$cfg")
+        health_check_config "$cfg" "$svc" || true
+        echo ""
+    done <<< "$all"
+}
+
+#===============================================================================
 # Server B Setup (Abroad - VPN Server with paqet server)
 #===============================================================================
 
@@ -1433,38 +1700,13 @@ setup_server_b() {
     echo -e "${CYAN}This server runs your V2Ray/X-UI and the paqet server${NC}"
     echo ""
     
-    # Detect network configuration
-    local interface=$(get_default_interface)
-    local local_ip=$(get_local_ip "$interface")
-    local public_ip=$(get_public_ip)
-    local gateway_mac=$(get_gateway_mac)
-    
-    echo -e "${YELLOW}Network Configuration Detected:${NC}"
-    echo -e "  Interface:   ${CYAN}$interface${NC}"
-    echo -e "  Local IP:    ${CYAN}$local_ip${NC}"
-    echo -e "  Public IP:   ${CYAN}$public_ip${NC}"
-    echo -e "  Gateway MAC: ${CYAN}$gateway_mac${NC}"
-    echo ""
-    
-    # Confirm or modify interface (with validation)
-    read_required "Network interface" interface "$interface"
-    
-    # Get local IP for that interface (with validation)
-    local_ip=$(get_local_ip "$interface")
-    if [ -z "$local_ip" ]; then
-        read_ip "Could not detect IP. Enter local IP" local_ip
-    else
-        read_optional "Local IP" local_ip "$local_ip"
-    fi
-    
-    # Confirm gateway MAC (with validation)
-    if [ -z "$gateway_mac" ]; then
-        read_mac "Could not detect gateway MAC. Enter gateway MAC address" gateway_mac
-    else
-        read_optional "Gateway MAC" input_mac "$gateway_mac"
-        [ -n "$input_mac" ] && gateway_mac="$input_mac"
-    fi
-    
+    # Detect + confirm network configuration in one step (V2)
+    detect_and_confirm_network
+    local interface="$NET_IFACE"
+    local local_ip="$NET_LOCAL_IP"
+    local public_ip="$NET_PUBLIC_IP"
+    local gateway_mac="$NET_GATEWAY_MAC"
+
     # paqet listen port (with validation)
     echo ""
     echo -e "${CYAN}Enter paqet listen port (for tunnel, NOT your V2Ray ports)${NC}"
@@ -1473,11 +1715,27 @@ setup_server_b() {
     # Check port conflict
     check_port_conflict "$PAQET_PORT" || return 0
     
-    # V2Ray ports to forward (with validation)
+    # V2Ray ports to forward (with validation) — reject collision with the paqet port
     echo ""
     echo -e "${CYAN}These are the ports your V2Ray/X-UI listens on${NC}"
-    read_ports "Enter V2Ray inbound ports (comma-separated)" INBOUND_PORTS "$DEFAULT_FORWARD_PORTS"
-    
+    while true; do
+        read_ports "Enter V2Ray inbound ports (comma-separated)" INBOUND_PORTS "$DEFAULT_FORWARD_PORTS"
+        local collision=""
+        local p
+        IFS=',' read -ra _CHECK_PORTS <<< "$INBOUND_PORTS"
+        for p in "${_CHECK_PORTS[@]}"; do
+            p=$(echo "$p" | tr -d ' ')
+            [ "$p" = "$PAQET_PORT" ] && collision="$p"
+        done
+        if [ -n "$collision" ]; then
+            print_error "Port $collision is also the paqet tunnel port — they cannot be the same."
+            print_info "Pick a different paqet port or different V2Ray port(s)."
+            echo ""
+        else
+            break
+        fi
+    done
+
     # Generate or input secret key
     echo ""
     local secret_key=$(generate_secret_key)
@@ -1496,6 +1754,7 @@ setup_server_b() {
     cat > "$PAQET_CONFIG" << EOF
 # paqet Server Configuration
 # Generated by installer on $(date)
+# inbound_ports: ${INBOUND_PORTS}
 role: "server"
 
 log:
@@ -1532,6 +1791,14 @@ EOF
     # Start service
     start_and_verify_service "$PAQET_SERVICE" "Server B service" || return 1
     
+    # Build the one-paste connection string for Server A (V2)
+    local conn_string
+    conn_string=$(encode_connection_string "$public_ip" "$PAQET_PORT" "$secret_key" "$INBOUND_PORTS")
+
+    # Post-setup health check
+    echo ""
+    health_check_config "$PAQET_CONFIG" "$PAQET_SERVICE" "$INBOUND_PORTS" || true
+
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}                 Server B Ready!                            ${NC}"
@@ -1541,13 +1808,23 @@ EOF
     echo -e "  ${YELLOW}paqet Port:${NC}    ${CYAN}$PAQET_PORT${NC}"
     echo -e "  ${YELLOW}V2Ray Ports:${NC}   ${CYAN}$INBOUND_PORTS${NC}"
     echo ""
-    echo -e "${YELLOW}Secret Key (save this for Server A):${NC}"
-    echo -e "${CYAN}$secret_key${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}  CONNECTION STRING — copy this to Server A (Iran):${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${CYAN}${conn_string}${NC}"
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    print_info "On Server A, choose 'Setup Server A' and paste the string above."
+    echo ""
+    echo -e "${YELLOW}(Manual fallback — if you prefer typing it in):${NC}"
+    echo -e "  Server B IP: ${CYAN}$public_ip${NC}   Port: ${CYAN}$PAQET_PORT${NC}   Ports: ${CYAN}$INBOUND_PORTS${NC}"
+    echo -e "  Secret Key:  ${CYAN}$secret_key${NC}"
     echo ""
     echo -e "${YELLOW}Next Steps:${NC}"
-    echo -e "  1. Make sure V2Ray/X-UI is running on ports: ${CYAN}$INBOUND_PORTS${NC}"
-    echo -e "  2. Run this installer on Server A with same secret key"
-    echo -e "  3. Open port ${CYAN}$PAQET_PORT${NC} in cloud firewall (if any)"
+    echo -e "  1. Make sure V2Ray/X-UI listens on 0.0.0.0 for ports: ${CYAN}$INBOUND_PORTS${NC}"
+    echo -e "  2. Run this installer on Server A and paste the connection string"
+    echo -e "  3. Open port ${CYAN}$PAQET_PORT${NC} in your cloud firewall (if any)"
     echo ""
     echo -e "${YELLOW}Commands:${NC}"
     echo -e "  Status:  ${CYAN}systemctl status $PAQET_SERVICE${NC}"
@@ -1582,54 +1859,75 @@ setup_server_a() {
     echo -e "  Service: ${CYAN}$PAQET_SERVICE${NC}"
     echo ""
     
-    # Detect network configuration
-    local interface=$(get_default_interface)
-    local local_ip=$(get_local_ip "$interface")
-    local public_ip=$(get_public_ip)
-    local gateway_mac=$(get_gateway_mac)
-    
-    echo -e "${YELLOW}Network Configuration Detected:${NC}"
-    echo -e "  Interface:   ${CYAN}$interface${NC}"
-    echo -e "  Local IP:    ${CYAN}$local_ip${NC}"
-    echo -e "  Public IP:   ${CYAN}$public_ip${NC}"
-    echo -e "  Gateway MAC: ${CYAN}$gateway_mac${NC}"
-    echo ""
-    
-    # Get Server B details (with validation - keeps asking until valid)
-    echo -e "${CYAN}Enter Server B (Abroad) connection details for tunnel '${TUNNEL_NAME}'${NC}"
-    read_ip "Server B public IP address" SERVER_B_IP
-    
-    echo ""
-    read_port "paqet port on Server B" SERVER_B_PORT "$DEFAULT_PAQET_PORT"
-    
-    echo ""
-    read_required "Secret key (from Server B setup)" SECRET_KEY
-    
-    # Confirm or modify interface (with validation)
-    echo ""
-    read_required "Network interface" interface "$interface"
-    
-    # Get local IP for that interface (with validation)
-    local_ip=$(get_local_ip "$interface")
-    if [ -z "$local_ip" ]; then
-        read_ip "Could not detect IP. Enter local IP" local_ip
-    else
-        read_optional "Local IP" local_ip "$local_ip"
+    # Get Server B details — paste connection string (V2) or enter manually
+    SERVER_B_IP=""
+    SERVER_B_PORT=""
+    SECRET_KEY=""
+    local prefill_ports=""
+    echo -e "${CYAN}Paste the Connection String from Server B (starts with 'paqet://').${NC}"
+    echo -e "${CYAN}Or press Enter to type the details manually.${NC}"
+    local conn_input=""
+    read_optional "Connection string" conn_input
+    if [ -n "$conn_input" ]; then
+        if decode_connection_string "$conn_input"; then
+            SERVER_B_IP="$CS_IP"
+            SERVER_B_PORT="$CS_PORT"
+            SECRET_KEY="$CS_KEY"
+            prefill_ports="$CS_FWD"
+            echo ""
+            print_success "Connection string decoded:"
+            echo -e "  Server B IP:   ${CYAN}$SERVER_B_IP${NC}"
+            echo -e "  paqet Port:    ${CYAN}$SERVER_B_PORT${NC}"
+            echo -e "  Forward Ports: ${CYAN}$prefill_ports${NC}"
+            echo -e "  Secret Key:    ${CYAN}${SECRET_KEY:0:6}…${NC} (hidden)"
+            echo ""
+            local cs_ok=true
+            read_confirm "Use these details?" cs_ok "y"
+            [ "$cs_ok" != true ] && { SERVER_B_IP=""; SERVER_B_PORT=""; SECRET_KEY=""; prefill_ports=""; }
+        else
+            print_error "Could not decode that connection string — falling back to manual entry."
+        fi
     fi
-    
-    # Confirm gateway MAC (with validation)
-    if [ -z "$gateway_mac" ]; then
-        read_mac "Could not detect gateway MAC. Enter gateway MAC address" gateway_mac
-    else
-        read_optional "Gateway MAC" input_mac "$gateway_mac"
-        [ -n "$input_mac" ] && gateway_mac="$input_mac"
+
+    # Manual entry / confirmation for any field not filled from the connection string
+    if [ -z "$SERVER_B_IP" ]; then
+        echo ""
+        echo -e "${CYAN}Enter Server B (Abroad) connection details for tunnel '${TUNNEL_NAME}'${NC}"
+        read_ip "Server B public IP address" SERVER_B_IP
     fi
-    
-    # Ports to forward (with validation)
+    if [ -z "$SERVER_B_PORT" ]; then
+        echo ""
+        echo -e "${YELLOW}This is the paqet TUNNEL port from Server B setup (default ${DEFAULT_PAQET_PORT}).${NC}"
+        echo -e "${YELLOW}It is NOT your V2Ray/inbound port — that comes later.${NC}"
+        read_port "Server B paqet tunnel port" SERVER_B_PORT "$DEFAULT_PAQET_PORT"
+    fi
+    [ -z "$SECRET_KEY" ] && { echo ""; read_required "Secret key (from Server B setup)" SECRET_KEY; }
+
+    # Detect + confirm local network in one step (V2)
+    echo ""
+    detect_and_confirm_network
+    local interface="$NET_IFACE"
+    local local_ip="$NET_LOCAL_IP"
+    local public_ip="$NET_PUBLIC_IP"
+    local gateway_mac="$NET_GATEWAY_MAC"
+
+    # Ports to forward (with validation) — default to the ports from the connection string
     echo ""
     echo -e "${CYAN}These will be accessible on this server and forwarded to Server B${NC}"
-    read_ports "Enter ports to forward (comma-separated)" FORWARD_PORTS "$DEFAULT_FORWARD_PORTS"
-    
+    read_ports "Enter ports to forward (comma-separated)" FORWARD_PORTS "${prefill_ports:-$DEFAULT_FORWARD_PORTS}"
+
+    # Guard: B's paqet tunnel port must differ from the forwarded (V2Ray) ports.
+    # On Server B, paqet listens on the tunnel port and forwards to V2Ray on a
+    # different port, so these can never legitimately collide. If they do, the
+    # user almost certainly entered their V2Ray port as the paqet port.
+    while echo ",${FORWARD_PORTS}," | tr -d ' ' | grep -q ",${SERVER_B_PORT},"; do
+        echo ""
+        print_error "Server B paqet port (${SERVER_B_PORT}) is also in your forward ports (${FORWARD_PORTS})."
+        print_info "The paqet port is the TUNNEL port from Server B (default ${DEFAULT_PAQET_PORT}), not a V2Ray port."
+        print_info "Dialing the V2Ray port instead of the tunnel port is the #1 cause of 'connection lost'."
+        read_port "Re-enter Server B paqet tunnel port" SERVER_B_PORT "$DEFAULT_PAQET_PORT"
+    done
+
     # Check port conflicts
     echo ""
     IFS=',' read -ra PORTS <<< "$FORWARD_PORTS"
@@ -1703,7 +2001,12 @@ EOF
     
     # Start service
     start_and_verify_service "$PAQET_SERVICE" "Tunnel '${TUNNEL_NAME}'" || return 1
-    
+
+    # Post-setup end-to-end health check (verifies the tunnel actually passes traffic)
+    echo ""
+    health_check_config "$PAQET_CONFIG" "$PAQET_SERVICE" || \
+        print_warning "If the tunnel is down, make sure Server B's paqet was RESTARTED after its setup."
+
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}          Server A Tunnel '${TUNNEL_NAME}' Ready!              ${NC}"
@@ -1929,10 +2232,6 @@ view_config() {
     else
         print_error "Configuration not found at $PAQET_CONFIG"
     fi
-    
-    echo ""
-    echo -e "${YELLOW}Press Enter to continue...${NC}"
-    read < /dev/tty
 }
 
 #===============================================================================
@@ -3825,59 +4124,75 @@ main() {
         echo ""
         
         local host_role=$(detect_host_role)
-        
-        echo -e "${YELLOW}Select option:${NC}"
-        echo ""
-        echo -e "  ${GREEN}── Setup ──${NC}"
-        if [ "$host_role" = "none" ] || [ "$host_role" = "server" ] || [ "$host_role" = "mixed" ]; then
-            if [ "$host_role" = "server" ]; then
-                echo -e "  ${CYAN}1)${NC} Reconfigure Server B (Abroad - VPN server)"
-            else
-                echo -e "  ${CYAN}1)${NC} Setup Server B (Abroad - VPN server)"
+
+        if [ "$host_role" = "none" ]; then
+            # ── First-run wizard (V2): nothing configured yet ──
+            echo -e "${GREEN}Welcome! Let's get your tunnel running in two steps.${NC}"
+            echo -e "${CYAN}Set up the Abroad server first, then the Iran server.${NC}"
+            echo ""
+            echo -e "${YELLOW}Which server is THIS machine?${NC}"
+            echo ""
+            echo -e "  ${CYAN}1)${NC} Abroad server (B)  — runs your VPN / V2Ray / X-UI"
+            echo -e "  ${CYAN}2)${NC} Iran entry server (A) — the IP your clients connect to"
+            echo ""
+            echo -e "  ${GREEN}── Other ──${NC}"
+            echo -e "  ${CYAN}f)${NC} IPTables Port Forwarding (relay/NAT, no paqet)"
+            if ! is_command_installed; then
+                echo -e "  ${CYAN}i)${NC} Install as 'paqet-tunnel' command"
             fi
+            echo -e "  ${CYAN}h)${NC} Donate / Support project"
+            echo -e "  ${CYAN}0)${NC} Exit"
+            echo ""
+        else
+            # ── Power-user menu (V2): role-aware, grouped ──
+            echo -e "${YELLOW}Select option:${NC}"
+            echo ""
+            echo -e "  ${GREEN}── Setup ──${NC}"
+            if [ "$host_role" = "server" ] || [ "$host_role" = "mixed" ]; then
+                echo -e "  ${CYAN}1)${NC} Reconfigure Server B (Abroad - VPN server)"
+            elif [ "$host_role" = "client" ]; then
+                echo -e "  ${CYAN}2)${NC} Setup / add tunnel — Server A (Iran - entry point)"
+            fi
+            if [ "$host_role" = "mixed" ]; then
+                echo -e "  ${CYAN}2)${NC} Setup / add tunnel — Server A (Iran - entry point)"
+            fi
+            if [ "$host_role" = "server" ] || [ "$host_role" = "mixed" ]; then
+                echo -e "  ${CYAN}k)${NC} Show Connection String (to paste on Server A)"
+            fi
+            echo ""
+            echo -e "  ${GREEN}── Diagnostics ──${NC}"
+            echo -e "  ${CYAN}c)${NC} Run Health Check (verify the tunnel end-to-end)"
+            echo -e "  ${CYAN}3)${NC} Check Status"
+            echo -e "  ${CYAN}7)${NC} Test Connection"
+            echo -e "  ${CYAN}4)${NC} View Configuration"
+            echo ""
+            echo -e "  ${GREEN}── Manage ──${NC}"
+            echo -e "  ${CYAN}5)${NC} Edit Configuration"
+            case "$host_role" in
+                server) echo -e "  ${CYAN}6)${NC} Manage Server (restart/stop/start)" ;;
+                client) echo -e "  ${CYAN}6)${NC} Manage Tunnels (add/remove/restart)" ;;
+                mixed)  echo -e "  ${CYAN}6)${NC} Manage (Server B or Tunnels)" ;;
+            esac
+            echo ""
+            echo -e "  ${GREEN}── Maintenance ──${NC}"
+            echo -e "  ${CYAN}8)${NC} Check for Updates"
+            echo -e "  ${CYAN}9)${NC} Show Port Defaults"
+            echo -e "  ${CYAN}a)${NC} Automatic Reset (scheduled restart)"
+            echo -e "  ${CYAN}d)${NC} Connection Protection & MTU Tuning (fix fake RST/disconnects)"
+            echo -e "  ${CYAN}f)${NC} IPTables Port Forwarding (relay/NAT)"
+            echo -e "  ${CYAN}u)${NC} Uninstall paqet"
+            echo ""
+            echo -e "  ${GREEN}── Script ──${NC}"
+            if ! is_command_installed; then
+                echo -e "  ${CYAN}i)${NC} Install as 'paqet-tunnel' command"
+            fi
+            echo -e "  ${CYAN}r)${NC} Remove paqet-tunnel command"
+            echo -e "  ${CYAN}h)${NC} Donate / Support project"
+            echo -e "  ${CYAN}0)${NC} Exit"
+            echo ""
         fi
-        if [ "$host_role" = "none" ] || [ "$host_role" = "client" ] || [ "$host_role" = "mixed" ]; then
-            echo -e "  ${CYAN}2)${NC} Setup Server A (Iran - entry point)"
-        fi
-        echo ""
-        echo -e "  ${GREEN}── Management ──${NC}"
-        echo -e "  ${CYAN}3)${NC} Check Status"
-        echo -e "  ${CYAN}4)${NC} View Configuration"
-        echo -e "  ${CYAN}5)${NC} Edit Configuration"
-        case "$host_role" in
-            server)
-                echo -e "  ${CYAN}6)${NC} Manage Server (restart/stop/start)"
-                ;;
-            client)
-                echo -e "  ${CYAN}6)${NC} Manage Tunnels (add/remove/restart)"
-                ;;
-            mixed)
-                echo -e "  ${CYAN}6)${NC} Manage (Server B or Tunnels)"
-                ;;
-            none)
-                echo -e "  ${CYAN}6)${NC} Manage (setup required first)"
-                ;;
-        esac
-        echo -e "  ${CYAN}7)${NC} Test Connection"
-        echo ""
-        echo -e "  ${GREEN}── Maintenance ──${NC}"
-        echo -e "  ${CYAN}8)${NC} Check for Updates"
-        echo -e "  ${CYAN}9)${NC} Show Port Defaults"
-        echo -e "  ${CYAN}a)${NC} Automatic Reset (scheduled restart)"
-        echo -e "  ${CYAN}d)${NC} Connection Protection & MTU Tuning (fix fake RST/disconnects)"
-        echo -e "  ${CYAN}f)${NC} IPTables Port Forwarding (relay/NAT)"
-        echo -e "  ${CYAN}u)${NC} Uninstall paqet"
-        echo ""
-        echo -e "  ${GREEN}── Script ──${NC}"
-        if ! is_command_installed; then
-            echo -e "  ${CYAN}i)${NC} Install as 'paqet-tunnel' command"
-        fi
-        echo -e "  ${CYAN}r)${NC} Remove paqet-tunnel command"
-        echo -e "  ${CYAN}h)${NC} Donate / Support project"
-        echo -e "  ${CYAN}0)${NC} Exit"
-        echo ""
         read -p "Choice: " choice < /dev/tty
-        
+
         case $choice in
             1)
                 if [ "$host_role" = "client" ]; then
@@ -3898,6 +4213,8 @@ main() {
             5) edit_config ;;
             6) run_manage_menu ;;
             7) test_connection ;;
+            [Cc]) run_health_check_menu ;;
+            [Kk]) show_connection_string ;;
             8) check_for_updates ;;
             9) show_port_config ;;
             [Aa]) auto_reset_menu ;;

@@ -2,7 +2,7 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.11.5
+**Current Version:** v2.0.0
 
 ## Start Here
 
@@ -40,11 +40,12 @@ ssh root@<SERVER_B_IP>
 bash <(curl -fsSL https://raw.githubusercontent.com/g3ntrix/paqet-tunnel/main/install.sh)
 ```
 
-1. Select option **1** (Setup Server B)
-2. Confirm network settings (auto-detected)
+1. Select option **1** (Abroad server B)
+2. Confirm the auto-detected network settings (one Enter)
 3. Choose paqet port (default: `8888`)
 4. Enter V2Ray port(s) (e.g., `443`)
-5. **Save the generated secret key!**
+5. A **health check** runs automatically, then a **Connection String** is printed
+6. **Copy the Connection String** — you'll paste it on Server A (it bundles the IP, port, key, and ports)
 
 ### Step 2: Setup Server A (Iran - Entry Point)
 
@@ -55,14 +56,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/g3ntrix/paqet-tunnel/main/in
 
 > **Note:** If download is blocked in Iran, the installer will ask for a local file path. Download the paqet binary manually and provide the path.
 
-1. Select option **2** (Setup Server A)
+1. Select option **2** (Iran entry server A)
 2. **Optional:** Run Iran network optimization (DNS + apt mirrors)
 3. Enter a **tunnel name** (e.g., `usa`, `germany`)
-4. Enter Server B's IP address
-5. Enter paqet port: `8888`
-6. Enter the **secret key** from Step 1
-7. Confirm network settings
-8. Enter port(s) to forward (same as V2Ray ports)
+4. **Paste the Connection String** from Step 1 — IP, port, key, and ports are filled in automatically
+   - _Or press Enter to type the details (IP, port, secret key) manually_
+5. Confirm the auto-detected network settings (one Enter)
+6. Confirm port(s) to forward (pre-filled from the Connection String)
+7. A **health check** runs automatically and reports PASS/FAIL
+
+> **Tip:** If the health check fails with "no return packets", make sure Server B's paqet was restarted after its setup. V2 always restarts on config change, so this only affects servers configured with older versions.
 
 To add more tunnels, run setup again (option **2** or via **Manage Tunnels**) with a different name.
 
@@ -397,6 +400,16 @@ Each tunnel has its own config (`/opt/paqet/config-<name>.yaml`) and service (`p
 4. Response flows back through the tunnel
 
 ### Changelog
+
+#### v2.0.0
+- **Guided wizard-first setup** - First run on an unconfigured host asks one question (Abroad B or Iran A) and walks you through a streamlined flow.
+- **One-step network detection** - Interface, local IP, public IP, and gateway MAC are auto-detected and confirmed with a single Enter (manual entry only if detection fails or you decline).
+- **Connection String** - Server B prints a single `paqet://…` token bundling its IP, port, secret key, and ports. Paste it on Server A to auto-fill everything — no more re-typing the 30-char key. Manual entry remains as a fallback.
+- **Automatic health check** - After setup (and from the new menu option **c**), an end-to-end check reports PASS/FAIL: service active, ports listening, tunnel return traffic, and no `connection lost` churn.
+- **Stale-config fix** - Services are now always `restart`ed (not `start`ed) on config change, so a re-run/reconfigure always loads the new config. This was the root cause of "works on some servers, not others".
+- **Port-collision guard** - Server B setup rejects a paqet port that matches a V2Ray port.
+- **Config fix** - Server config now includes `remote_flag: ["PA"]` and `pcap.sockbuf`, matching the client and required for reliable inbound packet capture.
+- **Reorganized menu** - Grouped into Setup / Diagnostics / Manage / Maintenance / Script.
 
 #### v1.11.5
 - **Role-Aware Menu** - Main menu detects Server B vs Server A and shows the relevant setup and manage options for each role.
